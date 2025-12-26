@@ -27,8 +27,11 @@ from UM.Scene.SceneNodeDecorator import SceneNodeDecorator
 from UM.Scene.Selection import Selection
 from UM.Math.Vector import Vector
 from UM.Math.Quaternion import Quaternion
+from UM.Math.Color import Color
 from UM.PluginRegistry import PluginRegistry
 from UM.Operations.GravityOperation import GravityOperation
+from UM.Resources import Resources
+from UM.View.GL.OpenGL import OpenGL
 
 from cura.Settings.ExtruderManager import ExtruderManager
 from cura.Scene.SliceableObjectDecorator import SliceableObjectDecorator
@@ -37,6 +40,8 @@ from cura.Settings.SettingOverrideDecorator import SettingOverrideDecorator
 
 class ProtectedSceneNode(SceneNode):
     """SceneNode that blocks decorator and child node additions to prevent unwanted modifications."""
+    
+    shader = None  # Shared shader for all prime tower instances
     
     def addDecorator(self, decorator: SceneNodeDecorator) -> None:
         if isinstance(decorator, (SliceableObjectDecorator, SettingOverrideDecorator)):
@@ -55,6 +60,22 @@ class ProtectedSceneNode(SceneNode):
             return None
         
         return super().callDecoration(function, *args, **kwargs)
+    
+    def render(self, renderer):
+        """Custom render method to apply cyan color to prime tower."""
+        if not ProtectedSceneNode.shader:
+            ProtectedSceneNode.shader = OpenGL.getInstance().createShaderProgram(
+                Resources.getPath(Resources.Shaders, "transparent_object.shader"))
+            ProtectedSceneNode.shader.setUniformValue("u_diffuseColor", Color(0.0, 0.8, 0.9, 1.0))
+            ProtectedSceneNode.shader.setUniformValue("u_opacity", 0.8)
+        
+        batch = renderer.getNamedBatch("prime_tower_visual")
+        if not batch:
+            batch = renderer.createRenderBatch(transparent=True, shader=ProtectedSceneNode.shader, backface_cull=True)
+            renderer.addRenderBatch(batch, name="prime_tower_visual")
+        
+        batch.addItem(self.getWorldTransformation(copy=False), self.getMeshData())
+        return True
 
 
 class NonSliceableDecorator(SceneNodeDecorator):
