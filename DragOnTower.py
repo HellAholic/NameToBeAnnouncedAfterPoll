@@ -18,7 +18,9 @@ import os
 from typing import Optional
 
 from PyQt6.QtCore import QObject
+from matplotlib.widgets import ToolLineHandles
 
+from UM import Tool
 from UM.Extension import Extension
 from UM.Application import Application
 from UM.Logger import Logger
@@ -133,11 +135,19 @@ class DragOnTower(Extension, QObject):
 
     def _toggleTools(self, enable: bool):
         """Enable or disable incompatible tools based on prime tower selection."""
-        self._controller.toolEnabledChanged.emit("RotateTool", enable)
-        self._controller.toolEnabledChanged.emit("MirrorTool", enable)
-        self._controller.toolEnabledChanged.emit("PaintTool", enable)
-        self._controller.toolEnabledChanged.emit("PerObjectSettingsTool", enable)
-        self._controller.toolEnabledChanged.emit("SupportEraser", enable)
+        tool_list = [
+            "RotateTool",
+            "MirrorTool",
+            "PaintTool",
+            "PerObjectSettingsTool",
+            "SupportEraser"
+        ]
+        for tool in tool_list:
+            try:
+                self._controller.toolEnabledChanged.emit(tool, enable)
+            except Exception as e:
+                Logger.log("e", f"Failed to toggle tool {tool}: {e}")
+                pass
 
     def _onSelectionChanged(self):
         """Disable incompatible tools when prime tower is selected, re-enable when deselected."""
