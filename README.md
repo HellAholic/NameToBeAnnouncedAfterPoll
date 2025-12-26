@@ -5,7 +5,7 @@
 > Drag, position, and visualize your prime tower directly on the build plate - no more guessing where it will print!
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Cura Version](https://img.shields.io/badge/Cura-5.x-orange.svg)](https://ultimaker.com/software/ultimaker-cura)
+[![Cura Version](https://img.shields.io/badge/Cura-5.11-orange.svg)](https://ultimaker.com/software/ultimaker-cura)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
 ## 🎯 What is DragOnTower?
@@ -80,7 +80,7 @@ The visual tower responds to these settings:
 ## 🔧 Technical Details
 
 ### Requirements
-- **Cura Version**: 5.0+
+- **Cura Version**: 5.11+
 - **API Level**: 8
 - **Python**: 3.8+
 - **Dependencies**: PyQt6, Uranium, Cura libraries (included with Cura)
