@@ -18,9 +18,7 @@ import os
 from typing import Optional
 
 from PyQt6.QtCore import QObject
-from matplotlib.widgets import ToolLineHandles
 
-from UM import Tool
 from UM.Extension import Extension
 from UM.Application import Application
 from UM.Logger import Logger
@@ -107,8 +105,7 @@ class DragOnTower(Extension, QObject):
     MIN_EXTRUDERS_FOR_TOWER = 2
     
     def __init__(self):
-        QObject.__init__(self)
-        Extension.__init__(self)
+        super().__init__()
         
         self._application = Application.getInstance()
         self._controller = self._application.getController()
