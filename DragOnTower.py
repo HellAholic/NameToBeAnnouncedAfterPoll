@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import os
 from typing import Optional
 
 from PyQt6.QtCore import QObject
@@ -28,7 +27,6 @@ from UM.Scene.Selection import Selection
 from UM.Math.Vector import Vector
 from UM.Math.Quaternion import Quaternion
 from UM.Math.Color import Color
-from UM.PluginRegistry import PluginRegistry
 from UM.Operations.GravityOperation import GravityOperation
 from UM.Resources import Resources
 from UM.View.GL.OpenGL import OpenGL
@@ -37,11 +35,14 @@ from cura.Settings.ExtruderManager import ExtruderManager
 from cura.Scene.SliceableObjectDecorator import SliceableObjectDecorator
 from cura.Settings.SettingOverrideDecorator import SettingOverrideDecorator
 
+from .PrimeTowerMeshBuilder import PrimeTowerMeshBuilder
+
 
 class ProtectedSceneNode(SceneNode):
     """SceneNode that blocks decorator and child node additions to prevent unwanted modifications."""
     
     shader = None  # Shared shader for all prime tower instances
+    collision_detected = False  # Track collision state for color changes
     
     def addDecorator(self, decorator: SceneNodeDecorator) -> None:
         if isinstance(decorator, (SliceableObjectDecorator, SettingOverrideDecorator)):
@@ -62,16 +63,22 @@ class ProtectedSceneNode(SceneNode):
         return super().callDecoration(function, *args, **kwargs)
     
     def render(self, renderer):
-        """Custom render method to apply cyan color to prime tower."""
+        """Custom render method to apply cyan color to prime tower with proper shading."""
         if not ProtectedSceneNode.shader:
             ProtectedSceneNode.shader = OpenGL.getInstance().createShaderProgram(
-                Resources.getPath(Resources.Shaders, "transparent_object.shader"))
-            ProtectedSceneNode.shader.setUniformValue("u_diffuseColor", Color(0.0, 0.8, 0.9, 1.0))
-            ProtectedSceneNode.shader.setUniformValue("u_opacity", 0.8)
+                Resources.getPath(Resources.Shaders, "object.shader"))
+
+        # Change color based on collision state
+        if ProtectedSceneNode.collision_detected:
+            color = Color(1.0, 0.0, 0.0, 1.0)  # Red when colliding
+        else:
+            color = Color(0.0, 0.8, 0.9, 1.0)  # Cyan when valid
+        
+        ProtectedSceneNode.shader.setUniformValue("u_diffuseColor", color)
         
         batch = renderer.getNamedBatch("prime_tower_visual")
         if not batch:
-            batch = renderer.createRenderBatch(transparent=True, shader=ProtectedSceneNode.shader, backface_cull=True)
+            batch = renderer.createRenderBatch(shader=ProtectedSceneNode.shader)
             renderer.addRenderBatch(batch, name="prime_tower_visual")
         
         batch.addItem(self.getWorldTransformation(copy=False), self.getMeshData())
@@ -140,14 +147,32 @@ class DragOnTower(Extension, QObject):
         
         self._build_plate_y: float = 0.0
         self._original_mesh_diameter: float = 0.0
+        self._original_base_size: float = 0.0
+        self._original_base_height: float = 0.0
+        self._original_base_curve: float = 0.0
+        self._original_max_height: float = 0.0
         self._machine_width: float = self.DEFAULT_MACHINE_WIDTH
         self._machine_depth: float = self.DEFAULT_MACHINE_DEPTH
         self._machine_center_is_zero: bool = False
         
+        # Track sliceable objects for height changes
+        self._tracked_objects = set()
+        
+        # Scale tool deferred update state
+        self._pending_scale_update: bool = False
+        self._pending_scale_value: float = 1.0
+        self._pending_original_settings: Optional[tuple] = None  # (size, pos_x, pos_y) before scale operation
+        
         self._application.globalContainerStackChanged.connect(self._onGlobalStackChanged)
+        self._application.getController().toolOperationStopped.connect(self._onToolOperationStopped)
         self._scene.sceneChanged.connect(self._onSceneChanged)
         self._scene.sceneChanged.connect(self._onSceneObjectsChanged)
         Selection.selectionChanged.connect(self._onSelectionChanged)
+        
+        # Connect to BuildVolume raftThicknessChanged signal to update tower color when errors change
+        build_volume = self._application.getBuildVolume()
+        if build_volume:
+            build_volume.raftThicknessChanged.connect(self._checkTowerCollision)
         
         self._onGlobalStackChanged()
 
@@ -223,10 +248,117 @@ class DragOnTower(Extension, QObject):
         
         if source and source.callDecoration("isSliceable"):
             self._checkAndCreatePrimeTowerNode()
+            # Track this object's transformations to detect height changes
+            if source not in self._tracked_objects:
+                self._tracked_objects.add(source)
+                try:
+                    source.transformationChanged.connect(self._onSliceableObjectTransformed)
+                except:
+                    pass
+            # Check if max height changed (model added or moved)
+            if self._prime_tower_node:
+                new_max_height = self._getMaxModelHeight()
+                if abs(new_max_height - self._original_max_height) > 0.01:  # Tolerance for floating point
+                    self._regenerateMesh()
         elif source and source.getParent() is None:
+            # Object removed - stop tracking
+            if source in self._tracked_objects:
+                self._tracked_objects.discard(source)
+                try:
+                    source.transformationChanged.disconnect(self._onSliceableObjectTransformed)
+                except:
+                    pass
             self._checkAndCreatePrimeTowerNode()
         elif not self._prime_tower_node:
             self._checkAndCreatePrimeTowerNode()
+    
+    def _onSliceableObjectTransformed(self, node: SceneNode):
+        """Check if max height changed when a sliceable object is transformed.
+        
+        This is connected to each sliceable object's transformationChanged signal
+        to detect when models are moved, scaled, or rotated that might affect
+        the required prime tower height.
+        """
+        if not self._prime_tower_node or self._settings_update_in_progress:
+            return
+        
+        try:
+            new_max_height = self._getMaxModelHeight()
+            if abs(new_max_height - self._original_max_height) > 0.01:
+                self._regenerateMesh()
+        except Exception as e:
+            Logger.log("w", "Error checking height change: %s", str(e))
+    
+    def _onToolOperationStopped(self, event):
+        """Apply pending scale changes after tool operation completes.
+        
+        When the scale tool is released, this calculates the new tower size from the
+        scaled bounding box and updates both size and position settings to maintain
+        the tower's center position.
+        """
+        if not (self._pending_scale_update and self._prime_tower_node and self._global_stack):
+            return
+        
+        try:
+            self._pending_scale_update = False
+            stored_settings = self._pending_original_settings
+            self._pending_original_settings = None
+            
+            bbox = self._prime_tower_node.getBoundingBox()
+            if not bbox or stored_settings is None:
+                Logger.log("w", "Failed to apply scale: missing bounding box or stored settings")
+                return
+            
+            original_size, original_pos_x, original_pos_y = stored_settings
+            
+            # Calculate new tower size from scaled bounding box
+            # Bounding box includes the base, so subtract base margins from both sides
+            bbox_size = max(bbox.width, bbox.depth)
+            base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or original_size
+            new_tower_size = bbox_size - (2 * base_size)
+            
+            # Ensure size is valid
+            if new_tower_size <= 0:
+                Logger.log("w", "Invalid tower size after scale: %.2f", new_tower_size)
+                return
+            
+            # Calculate center position from original settings
+            corner_x = original_pos_x
+            corner_z = -original_pos_y
+            if not self._machine_center_is_zero:
+                corner_x -= self._machine_width / 2
+                corner_z += self._machine_depth / 2
+            
+            original_radius = original_size / 2.0
+            center_x = corner_x - original_radius
+            center_z = corner_z - original_radius
+            
+            # Calculate new corner position to maintain center with new size
+            new_radius = new_tower_size / 2.0
+            new_corner_x = center_x + new_radius
+            new_corner_z = center_z + new_radius
+            
+            # Convert back to settings coordinates
+            new_pos_x = new_corner_x
+            new_pos_z = new_corner_z
+            if not self._machine_center_is_zero:
+                new_pos_x += self._machine_width / 2
+                new_pos_z -= self._machine_depth / 2
+            new_pos_y = -new_pos_z
+            
+            # Update both size and position atomically
+            self._settings_update_in_progress = True
+            self._global_stack.setProperty("prime_tower_size", "value", new_tower_size)
+            self._global_stack.setProperty("prime_tower_position_x", "value", new_pos_x)
+            self._global_stack.setProperty("prime_tower_position_y", "value", new_pos_y)
+            self._settings_update_in_progress = False
+            
+            # Reset scale to 1.0 since we applied it to the setting
+            self._prime_tower_node.setScale(Vector(1.0, 1.0, 1.0))
+            
+        except Exception as e:
+            Logger.log("e", "Error applying scale changes: %s", str(e))
+            self._settings_update_in_progress = False
     
     def _onSettingValueChanged(self, key: str, property_name: str):
         """Update representation when relevant settings change."""
@@ -240,12 +372,21 @@ class DragOnTower(Extension, QObject):
         elif key == "machine_center_is_zero":
             self._machine_center_is_zero = bool(self._global_stack.getProperty("machine_center_is_zero", "value"))
         
-        prime_tower_settings = [
-            "prime_tower_enable",
+        # Settings that affect mesh geometry (require regeneration)
+        mesh_geometry_settings = [
             "prime_tower_size",
+            "prime_tower_base_size",
+            "prime_tower_base_height",
+            "prime_tower_base_curve_magnitude",
+            "layer_height"
+        ]
+        
+        # Settings that only affect position
+        position_settings = [
             "prime_tower_position_x",
             "prime_tower_position_y"
         ]
+        
         extruder_usage_settings = [
             "support_enable",
             "support_extruder_nr",
@@ -259,10 +400,14 @@ class DragOnTower(Extension, QObject):
             "skirt_brim_extruder_nr"
         ]
         
-        if key in prime_tower_settings:
+        if key == "prime_tower_enable":
             self._checkAndCreatePrimeTowerNode()
-            if key != "prime_tower_enable" and self._prime_tower_node:
-                self._updateNodeFromSettings()
+        elif key in mesh_geometry_settings:
+            if self._prime_tower_node:
+                self._regenerateMesh()
+        elif key in position_settings:
+            if self._prime_tower_node:
+                self._updateNodePosition()
         elif key in extruder_usage_settings:
             self._checkAndCreatePrimeTowerNode()
     
@@ -293,38 +438,42 @@ class DragOnTower(Extension, QObject):
         self._creating_prime_tower = True
         
         try:
-            plugin_path = PluginRegistry.getInstance().getPluginPath(self.getPluginId())
-            if not plugin_path:
-                Logger.log("e", "Could not get plugin path")
-                return
+            # Get prime tower settings
+            tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
+            base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or tower_size
+            base_height = self._global_stack.getProperty("prime_tower_base_height", "value") or 0.0
+            base_curve_magnitude = self._global_stack.getProperty("prime_tower_base_curve_magnitude", "value") or 4.0
+            layer_height = self._global_stack.getProperty("layer_height", "value") or 0.2
             
-            stl_path = os.path.join(plugin_path, "resources", "prime_tower.stl")
-            if not os.path.exists(stl_path):
-                Logger.log("e", f"Prime tower STL not found at: {stl_path}")
-                return
+            # Get the maximum model height from scene
+            tower_height = self._getMaxModelHeight()
+            if tower_height <= 0:
+                tower_height = 20.0  # Fallback height
+
+            # Generate the mesh
+            mesh_data = PrimeTowerMeshBuilder.buildPrimeTowerMesh(
+                tower_size=tower_size,
+                tower_height=tower_height,
+                base_size=base_size,
+                base_height=base_height,
+                base_curve_magnitude=base_curve_magnitude,
+                layer_height=layer_height
+            )
             
-            mesh_handler = Application.getInstance().getMeshFileHandler()
-            reader = mesh_handler.getReaderForFile(stl_path)
-            if not reader:
-                Logger.log("e", "No mesh reader found for STL file")
-                return
-            
-            node = reader.read(stl_path)
-            if not node:
-                Logger.log("e", "Failed to load prime tower mesh")
+            if not mesh_data:
+                Logger.log("e", "Failed to generate prime tower mesh")
                 return
             
             protected_node = ProtectedSceneNode()
-            protected_node.setMeshData(node.getMeshData())
+            protected_node.setMeshData(mesh_data)
             protected_node.setName("Prime Tower Visual")
             
             self._prime_tower_node = protected_node
-            
-            mesh_data = self._prime_tower_node.getMeshData()
-            if mesh_data:
-                extents = mesh_data.getExtents()
-                if extents:
-                    self._original_mesh_diameter = max(extents.width, extents.depth)
+            self._original_mesh_diameter = tower_size
+            self._original_base_size = base_size
+            self._original_base_height = base_height
+            self._original_base_curve = base_curve_magnitude
+            self._original_max_height = tower_height
             
             self._prime_tower_node.addDecorator(NonSliceableDecorator())
             self._prime_tower_node.addDecorator(PrimeTowerRepresentationDecorator())
@@ -332,8 +481,9 @@ class DragOnTower(Extension, QObject):
             self._prime_tower_node.setSelectable(True)
             
             self._scene.getRoot().addChild(self._prime_tower_node)
-            self._updateNodeFromSettings()
+            self._updateNodePosition()
             self._prime_tower_node.transformationChanged.connect(self._onNodeTransformChanged)
+            self._checkTowerCollision()
             
         finally:
             self._settings_update_in_progress = False
@@ -356,15 +506,57 @@ class DragOnTower(Extension, QObject):
         self._prime_tower_node = None
         self._prime_tower_was_selected = False
     
-    def _updateNodeFromSettings(self):
-        """Update node position and scale from prime tower settings."""
+    def _regenerateMesh(self):
+        """Regenerate tower mesh when geometry settings change."""
         if not self._prime_tower_node or not self._global_stack:
             return
         
         self._settings_update_in_progress = True
         
         try:
-            tower_size = self._global_stack.getProperty("prime_tower_size", "value")
+            tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
+            base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or tower_size
+            base_height = self._global_stack.getProperty("prime_tower_base_height", "value") or 0.0
+            base_curve_magnitude = self._global_stack.getProperty("prime_tower_base_curve_magnitude", "value") or 4.0
+            layer_height = self._global_stack.getProperty("layer_height", "value") or 0.2
+            
+            tower_height = self._getMaxModelHeight()
+            if tower_height <= 0:
+                tower_height = 100.0
+            
+            mesh_data = PrimeTowerMeshBuilder.buildPrimeTowerMesh(
+                tower_size=tower_size,
+                tower_height=tower_height,
+                base_size=base_size,
+                base_height=base_height,
+                base_curve_magnitude=base_curve_magnitude,
+                layer_height=layer_height
+            )
+            
+            if mesh_data:
+                self._prime_tower_node.setMeshData(mesh_data)
+                self._original_mesh_diameter = tower_size
+                self._original_base_size = base_size
+                self._original_base_height = base_height
+                self._original_base_curve = base_curve_magnitude
+                self._original_max_height = tower_height
+                
+                # Update position after mesh change
+                self._updateNodePosition()
+                self._checkTowerCollision()
+        
+        finally:
+            self._settings_update_in_progress = False
+    
+    def _updateNodePosition(self):
+        """Update node position from prime tower position settings."""
+        if not self._prime_tower_node or not self._global_stack:
+            return
+        
+        self._settings_update_in_progress = True
+        
+        try:
+            tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
             setting_x = self._global_stack.getProperty("prime_tower_position_x", "value")
             setting_y = self._global_stack.getProperty("prime_tower_position_y", "value")
             
@@ -379,20 +571,36 @@ class DragOnTower(Extension, QObject):
             scene_x -= radius
             scene_z -= radius
             
-            if self._original_mesh_diameter > 0:
-                scale_factor = tower_size / self._original_mesh_diameter
-                scale_vector = Vector(scale_factor, scale_factor, scale_factor)
-                self._prime_tower_node.setScale(scale_vector, SceneNode.TransformSpace.World)
-            
             gravity_op = GravityOperation(self._prime_tower_node)
             gravity_op.redo()
             self._build_plate_y = self._prime_tower_node.getPosition().y
             
             position = Vector(scene_x, self._build_plate_y, scene_z)
             self._prime_tower_node.setPosition(position, SceneNode.TransformSpace.World)
+            self._checkTowerCollision()
         
         finally:
             self._settings_update_in_progress = False
+    
+    def _checkTowerCollision(self):
+        """Check BuildVolume's error areas to determine if prime tower is in invalid position."""
+        if not self._prime_tower_node:
+            return
+        
+        try:
+            build_volume = self._application.getBuildVolume()
+            if not build_volume:
+                return
+            
+            # Check if BuildVolume has any error areas (which includes prime tower errors)
+            has_errors = build_volume.hasErrors()
+            
+            if has_errors != ProtectedSceneNode.collision_detected:
+                ProtectedSceneNode.collision_detected = has_errors
+                # Force a re-render by marking node as changed
+                self._prime_tower_node.transformationChanged.emit(self._prime_tower_node)
+        except Exception as e:
+            Logger.log("w", f"Error checking BuildVolume error state: {e}")
     
     def _onNodeTransformChanged(self, node: SceneNode):
         """Constrain transforms and sync to settings when node is modified."""
@@ -431,24 +639,71 @@ class DragOnTower(Extension, QObject):
                 self._prime_tower_node.setPosition(constrained_position, SceneNode.TransformSpace.World)
             
             self._updateSettingsFromNode()
+            self._checkTowerCollision()
         finally:
             self._settings_update_in_progress = False
     
+    def _getMaxModelHeight(self) -> float:
+        """Get the maximum height of all sliceable objects in the scene."""
+        max_height = 0.0
+        for node in self._scene.getRoot().getAllChildren():
+            if node.callDecoration("isSliceable") and node.getMeshData():
+                bbox = node.getBoundingBox()
+                if bbox:
+                    node_height = bbox.maximum.y
+                    if node_height > max_height:
+                        max_height = node_height
+        return max_height
+    
     def _updateSettingsFromNode(self):
-        """Update prime tower settings from node position and scale."""
+        """Update prime tower settings from node position and scale.
+        
+        This method handles two scenarios:
+        1. Scale tool active: Defers updates until tool is released to avoid constant regeneration
+        2. Position changes: Updates position settings immediately
+        """
         if not self._prime_tower_node or not self._global_stack or self._settings_update_in_progress:
             return
         
         self._settings_update_in_progress = True
         
         try:
-            position = self._prime_tower_node.getWorldPosition()
+            # Check if scale tool is currently active
+            controller = self._application.getController()
+            active_tool = controller.getActiveTool()
+            scale_tool_active = active_tool and active_tool.getPluginId() == "ScaleTool"
             
-            bbox = self._prime_tower_node.getBoundingBox()
-            if bbox:
-                tower_size = max(bbox.width, bbox.depth)
-            else:
-                tower_size = self.DEFAULT_TOWER_SIZE
+            # Check for scale transformation
+            scale = self._prime_tower_node.getScale()
+            scale_factor = max(scale.x, scale.z)
+            
+            if abs(scale_factor - 1.0) > 0.01:
+                if scale_tool_active:
+                    # Defer updates while scale tool is active
+                    if self._pending_original_settings is None:
+                        # Store original settings on first scale change
+                        original_size = self._global_stack.getProperty("prime_tower_size", "value")
+                        original_x = self._global_stack.getProperty("prime_tower_position_x", "value")
+                        original_y = self._global_stack.getProperty("prime_tower_position_y", "value")
+                        self._pending_original_settings = (original_size, original_x, original_y)
+                    
+                    self._pending_scale_update = True
+                    self._pending_scale_value = scale_factor
+                    return
+                else:
+                    # Tool not active - apply scale immediately
+                    new_tower_size = self._original_mesh_diameter * scale_factor
+                    self._global_stack.setProperty("prime_tower_size", "value", new_tower_size)
+                    self._prime_tower_node.setScale(Vector(1.0, 1.0, 1.0))
+                    return
+            
+            # Don't update position while scale tool is active (prevents shadow movement)
+            if scale_tool_active:
+                return
+            
+            # Only update position
+            position = self._prime_tower_node.getWorldPosition()
+            tower_size = self._original_mesh_diameter
             
             radius = tower_size / 2.0
             corner_x = position.x + radius
@@ -465,7 +720,6 @@ class DragOnTower(Extension, QObject):
             
             self._global_stack.setProperty("prime_tower_position_x", "value", setting_x)
             self._global_stack.setProperty("prime_tower_position_y", "value", setting_y)
-            self._global_stack.setProperty("prime_tower_size", "value", tower_size)
         
         finally:
             self._settings_update_in_progress = False
