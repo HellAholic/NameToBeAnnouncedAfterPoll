@@ -155,6 +155,9 @@ class DragOnTower(Extension, QObject):
         self._machine_depth: float = self.DEFAULT_MACHINE_DEPTH
         self._machine_center_is_zero: bool = False
         
+        # Track BuildVolume reference for reconnecting signals
+        self._build_volume = None
+        
         # Track sliceable objects for height changes
         self._tracked_objects = set()
         
@@ -168,11 +171,6 @@ class DragOnTower(Extension, QObject):
         self._scene.sceneChanged.connect(self._onSceneChanged)
         self._scene.sceneChanged.connect(self._onSceneObjectsChanged)
         Selection.selectionChanged.connect(self._onSelectionChanged)
-        
-        # Connect to BuildVolume raftThicknessChanged signal to update tower color when errors change
-        build_volume = self._application.getBuildVolume()
-        if build_volume:
-            build_volume.raftThicknessChanged.connect(self._checkTowerCollision)
         
         self._onGlobalStackChanged()
 
@@ -206,24 +204,63 @@ class DragOnTower(Extension, QObject):
         self._toggleTools(not is_prime_tower_selected)
     
     def _onGlobalStackChanged(self):
-        """Handle global container stack changes."""
-        if self._global_stack:
-            try:
-                self._global_stack.propertyChanged.disconnect(self._onSettingValueChanged)
-            except:
-                pass
+        """Handle global container stack changes (printer switching)."""
+        # Set signal to prevent regeneration during switch
+        self._settings_update_in_progress = True
         
-        if self._prime_tower_node:
-            self._removePrimeTowerNode()
-        
-        self._global_stack = self._application.getGlobalContainerStack()
-        
-        if self._global_stack:
-            self._global_stack.propertyChanged.connect(self._onSettingValueChanged)
-            self._machine_width = self._global_stack.getProperty("machine_width", "value") or self.DEFAULT_MACHINE_WIDTH
-            self._machine_depth = self._global_stack.getProperty("machine_depth", "value") or self.DEFAULT_MACHINE_DEPTH
-            self._machine_center_is_zero = bool(self._global_stack.getProperty("machine_center_is_zero", "value"))
+        try:
+            # Disconnect old stack signals
+            if self._global_stack:
+                try:
+                    self._global_stack.propertyChanged.disconnect(self._onSettingValueChanged)
+                except:
+                    pass
             
+            # Remove ALL prime tower mesh representations (including orphaned ones)
+            self._removeAllPrimeTowerNodes()
+            
+            # Clear collision state since BuildVolume will be recalculated for new printer
+            ProtectedSceneNode.collision_detected = False
+            
+            # Clear all internal references to position and settings
+            self._build_plate_y = 0.0
+            self._original_mesh_diameter = 0.0
+            self._original_base_size = 0.0
+            self._original_base_height = 0.0
+            self._original_base_curve = 0.0
+            self._original_max_height = 0.0
+            self._pending_scale_update = False
+            self._pending_scale_value = 1.0
+            self._pending_original_settings = None
+            self._tracked_objects.clear()
+            
+            # Get new global stack
+            self._global_stack = self._application.getGlobalContainerStack()
+            
+            # Connect to new printer and generate prime tower
+            if self._global_stack:
+                self._global_stack.propertyChanged.connect(self._onSettingValueChanged)
+                self._machine_width = self._global_stack.getProperty("machine_width", "value") or self.DEFAULT_MACHINE_WIDTH
+                self._machine_depth = self._global_stack.getProperty("machine_depth", "value") or self.DEFAULT_MACHINE_DEPTH
+                self._machine_center_is_zero = bool(self._global_stack.getProperty("machine_center_is_zero", "value"))
+                
+                # Reconnect to the NEW BuildVolume for the new printer
+                if self._build_volume:
+                    try:
+                        self._build_volume.raftThicknessChanged.disconnect(self._checkTowerCollision)
+                    except:
+                        pass
+                
+                self._build_volume = self._application.getBuildVolume()
+                if self._build_volume:
+                    self._build_volume.raftThicknessChanged.connect(self._checkTowerCollision)
+        
+        finally:
+            # Turn signal back to normal
+            self._settings_update_in_progress = False
+        
+        # Now create tower for new printer
+        if self._global_stack:
             self._checkAndCreatePrimeTowerNode()
     
     def _onSceneChanged(self, source: SceneNode):
@@ -240,7 +277,7 @@ class DragOnTower(Extension, QObject):
     
     def _onSceneObjectsChanged(self, source: SceneNode):
         """Check if prime tower should be recreated or visibility changed."""
-        if self._creating_prime_tower:
+        if self._creating_prime_tower or self._settings_update_in_progress:
             return
         
         if self._prime_tower_node and self._prime_tower_node.getParent() is None:
@@ -438,27 +475,8 @@ class DragOnTower(Extension, QObject):
         self._creating_prime_tower = True
         
         try:
-            # Get prime tower settings
-            tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
-            base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or tower_size
-            base_height = self._global_stack.getProperty("prime_tower_base_height", "value") or 0.0
-            base_curve_magnitude = self._global_stack.getProperty("prime_tower_base_curve_magnitude", "value") or 4.0
-            layer_height = self._global_stack.getProperty("layer_height", "value") or 0.2
-            
-            # Get the maximum model height from scene
-            tower_height = self._getMaxModelHeight()
-            if tower_height <= 0:
-                tower_height = 20.0  # Fallback height
-
             # Generate the mesh
-            mesh_data = PrimeTowerMeshBuilder.buildPrimeTowerMesh(
-                tower_size=tower_size,
-                tower_height=tower_height,
-                base_size=base_size,
-                base_height=base_height,
-                base_curve_magnitude=base_curve_magnitude,
-                layer_height=layer_height
-            )
+            mesh_data = self._generateTowerMesh()
             
             if not mesh_data:
                 Logger.log("e", "Failed to generate prime tower mesh")
@@ -469,11 +487,6 @@ class DragOnTower(Extension, QObject):
             protected_node.setName("Prime Tower Visual")
             
             self._prime_tower_node = protected_node
-            self._original_mesh_diameter = tower_size
-            self._original_base_size = base_size
-            self._original_base_height = base_height
-            self._original_base_curve = base_curve_magnitude
-            self._original_max_height = tower_height
             
             self._prime_tower_node.addDecorator(NonSliceableDecorator())
             self._prime_tower_node.addDecorator(PrimeTowerRepresentationDecorator())
@@ -483,8 +496,7 @@ class DragOnTower(Extension, QObject):
             self._scene.getRoot().addChild(self._prime_tower_node)
             self._updateNodePosition()
             self._prime_tower_node.transformationChanged.connect(self._onNodeTransformChanged)
-            self._checkTowerCollision()
-            
+
         finally:
             self._settings_update_in_progress = False
             self._creating_prime_tower = False
@@ -506,6 +518,81 @@ class DragOnTower(Extension, QObject):
         self._prime_tower_node = None
         self._prime_tower_was_selected = False
     
+    def _removeAllPrimeTowerNodes(self):
+        """Remove all prime tower nodes from the scene, including orphaned ones."""
+        # First remove our tracked node
+        if self._prime_tower_node:
+            self._removePrimeTowerNode()
+        
+        # Then search for any orphaned prime tower nodes and remove them
+        root = self._scene.getRoot()
+        nodes_to_remove = []
+        
+        for node in root.getChildren():
+            # Check if it's a prime tower by name or decorator
+            if node.getName() == "Prime Tower Visual":
+                nodes_to_remove.append(node)
+            else:
+                # Check for PrimeTowerRepresentationDecorator
+                for decorator in node.getDecorators():
+                    if hasattr(decorator, 'isPrimeTowerRepresentation') and decorator.isPrimeTowerRepresentation():
+                        nodes_to_remove.append(node)
+                        break
+        
+        # Remove all found nodes
+        for node in nodes_to_remove:
+            try:
+                if Selection.isSelected(node):
+                    Selection.remove(node)
+                root.removeChild(node)
+            except Exception as e:
+                Logger.log("w", f"Failed to remove prime tower node: {e}")
+        
+        # Ensure our reference is cleared
+        self._prime_tower_node = None
+        self._prime_tower_was_selected = False
+    
+    def _generateTowerMesh(self):
+        """Generate tower mesh based on current settings.
+        
+        Returns:
+            MeshData: The generated mesh data, or None if generation failed.
+        """
+        if not self._global_stack:
+            return None
+        
+        # Get prime tower settings
+        tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
+        base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or tower_size
+        base_height = self._global_stack.getProperty("prime_tower_base_height", "value") or 0.0
+        base_curve_magnitude = self._global_stack.getProperty("prime_tower_base_curve_magnitude", "value") or 4.0
+        layer_height = self._global_stack.getProperty("layer_height", "value") or 0.2
+        
+        # Get the maximum model height from scene
+        tower_height = self._getMaxModelHeight()
+        if not tower_height or tower_height <= 10:
+            tower_height = 20.0  # Fallback height
+
+        # Generate the mesh
+        mesh_data = PrimeTowerMeshBuilder.buildPrimeTowerMesh(
+            tower_size=tower_size,
+            tower_height=tower_height,
+            base_size=base_size,
+            base_height=base_height,
+            base_curve_magnitude=base_curve_magnitude,
+            layer_height=layer_height
+        )
+        
+        if mesh_data:
+            # Store original settings for comparison
+            self._original_mesh_diameter = tower_size
+            self._original_base_size = base_size
+            self._original_base_height = base_height
+            self._original_base_curve = base_curve_magnitude
+            self._original_max_height = tower_height
+        
+        return mesh_data
+        
     def _regenerateMesh(self):
         """Regenerate tower mesh when geometry settings change."""
         if not self._prime_tower_node or not self._global_stack:
@@ -514,37 +601,13 @@ class DragOnTower(Extension, QObject):
         self._settings_update_in_progress = True
         
         try:
-            tower_size = self._global_stack.getProperty("prime_tower_size", "value") or self.DEFAULT_TOWER_SIZE
-            base_size = self._global_stack.getProperty("prime_tower_base_size", "value") or tower_size
-            base_height = self._global_stack.getProperty("prime_tower_base_height", "value") or 0.0
-            base_curve_magnitude = self._global_stack.getProperty("prime_tower_base_curve_magnitude", "value") or 4.0
-            layer_height = self._global_stack.getProperty("layer_height", "value") or 0.2
-            
-            tower_height = self._getMaxModelHeight()
-            if tower_height <= 0:
-                tower_height = 100.0
-            
-            mesh_data = PrimeTowerMeshBuilder.buildPrimeTowerMesh(
-                tower_size=tower_size,
-                tower_height=tower_height,
-                base_size=base_size,
-                base_height=base_height,
-                base_curve_magnitude=base_curve_magnitude,
-                layer_height=layer_height
-            )
+            mesh_data = self._generateTowerMesh()
             
             if mesh_data:
                 self._prime_tower_node.setMeshData(mesh_data)
-                self._original_mesh_diameter = tower_size
-                self._original_base_size = base_size
-                self._original_base_height = base_height
-                self._original_base_curve = base_curve_magnitude
-                self._original_max_height = tower_height
                 
                 # Update position after mesh change
-                self._updateNodePosition()
-                self._checkTowerCollision()
-        
+                self._updateNodePosition()        
         finally:
             self._settings_update_in_progress = False
     
@@ -573,7 +636,7 @@ class DragOnTower(Extension, QObject):
             
             gravity_op = GravityOperation(self._prime_tower_node)
             gravity_op.redo()
-            self._build_plate_y = self._prime_tower_node.getPosition().y
+            self._build_plate_y = float(self._prime_tower_node.getPosition().y)
             
             position = Vector(scene_x, self._build_plate_y, scene_z)
             self._prime_tower_node.setPosition(position, SceneNode.TransformSpace.World)
@@ -588,12 +651,11 @@ class DragOnTower(Extension, QObject):
             return
         
         try:
-            build_volume = self._application.getBuildVolume()
-            if not build_volume:
+            if not self._build_volume:
                 return
             
             # Check if BuildVolume has any error areas (which includes prime tower errors)
-            has_errors = build_volume.hasErrors()
+            has_errors = self._build_volume.hasErrors()
             
             if has_errors != ProtectedSceneNode.collision_detected:
                 ProtectedSceneNode.collision_detected = has_errors
@@ -635,7 +697,7 @@ class DragOnTower(Extension, QObject):
             if (abs(position.y - constrained_y) > self.POSITION_TOLERANCE or 
                 abs(position.x - constrained_x) > self.POSITION_TOLERANCE or 
                 abs(position.z - constrained_z) > self.POSITION_TOLERANCE):
-                constrained_position = Vector(constrained_x, constrained_y, constrained_z)
+                constrained_position = Vector(float(constrained_x), float(constrained_y), float(constrained_z))
                 self._prime_tower_node.setPosition(constrained_position, SceneNode.TransformSpace.World)
             
             self._updateSettingsFromNode()
@@ -653,7 +715,7 @@ class DragOnTower(Extension, QObject):
                     node_height = bbox.maximum.y
                     if node_height > max_height:
                         max_height = node_height
-        return max_height
+        return float(max_height)
     
     def _updateSettingsFromNode(self):
         """Update prime tower settings from node position and scale.
@@ -688,7 +750,7 @@ class DragOnTower(Extension, QObject):
                         self._pending_original_settings = (original_size, original_x, original_y)
                     
                     self._pending_scale_update = True
-                    self._pending_scale_value = scale_factor
+                    self._pending_scale_value = float(scale_factor)
                     return
                 else:
                     # Tool not active - apply scale immediately
