@@ -1,12 +1,11 @@
 {
     "name": "DragOnTower",
     "author": "HellAholic",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Adds a visual representation of the prime tower to the build plate, allowing users to drag and resize it",
     "api": 8,
     "supported_sdk_versions": [
-        "8.0.0",
-        "8.1.0"
+        "8.9.0"
     ],
     "catalog": "cura",
     "i18n-catalog": "cura"
