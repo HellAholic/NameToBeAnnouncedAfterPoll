@@ -8,6 +8,9 @@
 [![Cura Version](https://img.shields.io/badge/Cura-5.11-orange.svg)](https://ultimaker.com/software/ultimaker-cura)
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
+## Disclaimer
+This plugin is provided "as is" without any warranty, express or implied. The user assumes all responsibility and risk for the use of this plugin. The authors and contributors are not liable for any damages, whether direct, indirect, consequential, or incidental, arising from the use or inability to use this plugin. This includes, but is not limited to, damage to equipment, loss of data, or any other losses. By using this plugin, you agree to these terms.
+
 ## 🎯 What is DragOnTower?
 
 DragOnTower adds an interactive 3D representation of the prime tower to your Cura build plate. Instead of just seeing coordinates in settings, you can now:
